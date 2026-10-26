@@ -513,6 +513,151 @@ def test_add_fillet_sw33_also_uses_new_path() -> None:
     assert result.data.name == "Fillet"
 
 
+def test_add_fillet_legacy_path_passes_the_14_arg_signature() -> None:
+    """SW 2024 and older: IFeatureManager.FeatureFillet3 takes 14 args.
+
+    The SW 2024 type library declares Options, R1, R2, Rho, Ftyp,
+    OverflowType, ConicRhoType and seven VARIANT arrays. Passing 15 made
+    every fillet fail with DISP_E_BADPARAMCOUNT.
+    """
+    adapter = _FakeFeatureAdapter()  # no swApp -> major 0 -> legacy path
+    captured: dict[str, tuple] = {}
+    feature = SimpleNamespace(Name="Fillet7")
+
+    def _fillet3(*args):
+        captured["args"] = args
+        return feature
+
+    adapter.currentModel = SimpleNamespace(
+        FeatureManager=SimpleNamespace(FeatureFillet3=_fillet3),
+        ClearSelection2=lambda *_args: True,
+        Extension=SimpleNamespace(SelectByID2=lambda *_args: True),
+    )
+
+    result = features._add_fillet_impl(adapter, 3.0, ["Edge<1>"])
+
+    assert result.is_success
+    assert result.data.name == "Fillet7"
+    args = captured["args"]
+    assert len(args) == 14
+    assert args[0] == 195
+    assert args[1] == pytest.approx(0.003)
+    assert all(arg is features._empty_variant() for arg in args[7:])
+
+
+def test_add_fillet_legacy_path_surfaces_com_error() -> None:
+    """A COM failure must reach the caller, not a bare 'Failed to create fillet'."""
+    adapter = _FakeFeatureAdapter()
+    adapter.currentModel = SimpleNamespace(
+        FeatureManager=SimpleNamespace(
+            FeatureFillet3=Mock(side_effect=RuntimeError("DISP_E_BADPARAMCOUNT"))
+        ),
+        ClearSelection2=lambda *_args: True,
+        Extension=SimpleNamespace(SelectByID2=lambda *_args: True),
+    )
+
+    result = features._add_fillet_impl(adapter, 3.0, ["Edge<1>"])
+
+    assert result.status == AdapterResultStatus.ERROR
+    assert "FeatureFillet3: DISP_E_BADPARAMCOUNT" in (result.error or "")
+
+
+# ---------------------------------------------------------------------------
+# create_extrusion: the profile sketch is resolved and selected explicitly
+# ---------------------------------------------------------------------------
+
+
+def _extrusion_model(feature_manager, select_by_id2, sketch: str = "Sketch1"):
+    return SimpleNamespace(
+        FeatureManager=feature_manager,
+        ClearSelection2=lambda *_args: True,
+        FirstFeature=_fake_sketch_feature(sketch),
+        Extension=SimpleNamespace(SelectByID2=select_by_id2),
+    )
+
+
+def test_create_extrusion_selects_named_sketch_before_extruding() -> None:
+    """The named sketch is selected first, so an earlier call that cleared
+    the selection can no longer leave the extrusion with no profile."""
+    calls: list[str] = []
+    feature = SimpleNamespace(Name="Boss-Extrude9")
+
+    def _select(name, *_args):
+        calls.append(f"select:{name}")
+        return True
+
+    def _extrude(*_args):
+        calls.append("extrude")
+        return feature
+
+    adapter = _FakeFeatureAdapter()
+    adapter.currentModel = _extrusion_model(
+        SimpleNamespace(FeatureExtrusion3=_extrude), _select, sketch="스케치33"
+    )
+
+    result = features._create_extrusion_impl(
+        adapter, ExtrusionParameters(depth=79.0, sketch_name="스케치33")
+    )
+
+    assert result.is_success
+    assert calls == ["select:스케치33", "extrude"]
+    assert result.data.parameters["sketch_name"] == "스케치33"
+
+
+def test_create_extrusion_unknown_sketch_name_fails_before_extruding() -> None:
+    feature_manager = SimpleNamespace(
+        FeatureExtrusion3=Mock(side_effect=AssertionError("should not be called"))
+    )
+    adapter = _FakeFeatureAdapter()
+    adapter.currentModel = _extrusion_model(feature_manager, lambda *_args: True)
+
+    result = features._create_extrusion_impl(
+        adapter, ExtrusionParameters(depth=5.0, sketch_name="Sketch9")
+    )
+
+    assert result.status == AdapterResultStatus.ERROR
+    assert "Sketch 'Sketch9' not found" in (result.error or "")
+    assert "Sketches available to extrude: Sketch1" in (result.error or "")
+    feature_manager.FeatureExtrusion3.assert_not_called()
+
+
+def test_create_extrusion_without_any_sketch_keeps_current_selection() -> None:
+    """No name and no tracked sketch: extrude the existing selection, untouched."""
+    select_by_id2 = Mock(return_value=True)
+    adapter = _FakeFeatureAdapter()
+    adapter.currentModel = _extrusion_model(
+        SimpleNamespace(FeatureExtrusion3=lambda *_args: SimpleNamespace(Name="B1")),
+        select_by_id2,
+    )
+
+    result = features._create_extrusion_impl(adapter, ExtrusionParameters(depth=5.0))
+
+    assert result.is_success
+    assert result.data.parameters["sketch_name"] is None
+    select_by_id2.assert_not_called()
+
+
+def test_create_extrusion_surfaces_each_com_variant_error() -> None:
+    adapter = _FakeFeatureAdapter()
+    adapter.currentModel = _extrusion_model(
+        SimpleNamespace(
+            FeatureExtrusion3=Mock(side_effect=RuntimeError("extrusion3 failed")),
+            FeatureExtrusion2=Mock(side_effect=RuntimeError("extrusion2 failed")),
+        ),
+        lambda *_args: True,
+    )
+
+    result = features._create_extrusion_impl(
+        adapter, ExtrusionParameters(depth=5.0, sketch_name="Sketch1")
+    )
+
+    assert result.status == AdapterResultStatus.ERROR
+    error = result.error or ""
+    assert "sketch 'Sketch1'" in error
+    assert "FeatureExtrusion3: extrusion3 failed" in error
+    assert "FeatureExtrusion2: extrusion2 failed" in error
+
+
 # ---------------------------------------------------------------------------
 # _offset_plane_distance — issue #84: InsertRefPlane's Distance constraint
 # takes a positive magnitude only; a negative offset must flip the
@@ -787,6 +932,215 @@ def test_select_edge_by_coord_retries_and_gives_up(point, responses, expected) -
     )
 
     assert features._select_edge_by_coord(adapter, *point, append=False) is expected
+
+
+# ---- geometric edge pick ------------------------------------------------------
+
+
+class _FakeEdge:
+    """A body edge: answers GetClosestPointOn and records Select4 calls."""
+
+    def __init__(self, closest, select_result: bool = True) -> None:
+        self._closest = closest
+        self._select_result = select_result
+        self.select_calls: list[tuple] = []
+
+    def GetClosestPointOn(self, x, y, z):
+        if isinstance(self._closest, Exception):
+            raise self._closest
+        return self._closest
+
+    def Select4(self, append, data):
+        self.select_calls.append((append, data))
+        return self._select_result
+
+
+def _edge_pick_model(bodies) -> SimpleNamespace:
+    """A part whose view-based SelectByID2 pick must never be reached."""
+    return SimpleNamespace(
+        GetBodies2=lambda *_args: bodies,
+        ForceRebuild3=lambda _rebuild: True,
+        SelectionManager=SimpleNamespace(
+            CreateSelectData=lambda: SimpleNamespace(Mark=None)
+        ),
+        Extension=SimpleNamespace(
+            SelectByID2=Mock(side_effect=AssertionError("view pick must not run"))
+        ),
+    )
+
+
+def _hide_module(monkeypatch, dotted: str) -> None:
+    """Make ``import <dotted>`` / ``from <parent> import <name>`` raise."""
+    import importlib
+    import sys
+
+    parent, _, name = dotted.rpartition(".")
+    if parent:
+        monkeypatch.delattr(importlib.import_module(parent), name, raising=False)
+    monkeypatch.setitem(sys.modules, dotted, None)
+
+
+def test_nearest_body_edge_picks_the_geometrically_closest_edge() -> None:
+    """Every body and edge is measured; unreadable ones are skipped."""
+    far = _FakeEdge((0.5, 0.5, 0.5))
+    near = _FakeEdge((0.0101, 0.0, 0.0))
+    bodies = (
+        SimpleNamespace(
+            GetEdges=lambda: (
+                far,
+                _FakeEdge(None),  # no closest point
+                _FakeEdge((0.0, 0.0)),  # too short to be a point
+                _FakeEdge(RuntimeError("stale edge")),
+                near,
+            )
+        ),
+        SimpleNamespace(GetEdges=lambda: None),  # a body with no edge array
+    )
+    adapter = _FakeFeatureAdapter()
+    adapter.currentModel = _edge_pick_model(bodies)
+
+    edge, distance = features._nearest_body_edge(adapter, 0.01, 0.0, 0.0)
+
+    assert edge is near
+    assert distance == pytest.approx(0.0001)
+
+
+def test_nearest_body_edge_accepts_a_single_body_dispatch() -> None:
+    only = _FakeEdge((0.0, 0.0, 0.0))
+    adapter = _FakeFeatureAdapter()
+    adapter.currentModel = _edge_pick_model(SimpleNamespace(GetEdges=lambda: [only]))
+
+    assert features._nearest_body_edge(adapter, 0.0, 0.0, 0.0) == (only, 0.0)
+
+
+def test_nearest_body_edge_without_bodies_is_none() -> None:
+    adapter = _FakeFeatureAdapter()
+    adapter.currentModel = _edge_pick_model(None)
+
+    assert features._nearest_body_edge(adapter, 0.0, 0.0, 0.0) is None
+
+
+def test_nearest_body_edge_without_type_info_is_none(monkeypatch) -> None:
+    _hide_module(monkeypatch, "solidworks_mcp.adapters.sw_type_info")
+    adapter = _FakeFeatureAdapter()
+    adapter.currentModel = _edge_pick_model((SimpleNamespace(GetEdges=lambda: []),))
+
+    assert features._nearest_body_edge(adapter, 0.0, 0.0, 0.0) is None
+
+
+def test_select_edge_by_coord_selects_the_nearest_edge_under_its_mark() -> None:
+    """A concave edge hidden from the view is still the one selected.
+
+    Live, a bottom-view SelectByID2 pick at the corner under a cantilevered
+    plate filleted the wall's bottom edges instead (volume -200.87 mm^3
+    instead of +177.69). The geometric pick never consults the view.
+    """
+    target = _FakeEdge((0.0265, 0.045, -0.006))
+    other = _FakeEdge((0.0265, -0.015, -0.006))
+    adapter = _FakeFeatureAdapter()
+    adapter.currentModel = _edge_pick_model(
+        (SimpleNamespace(GetEdges=lambda: (other, target)),)
+    )
+
+    selected = features._select_edge_by_coord(
+        adapter, 0.0265, 0.045, -0.006, append=True, mark=2
+    )
+
+    assert selected is True
+    assert other.select_calls == []
+    ((append, data),) = target.select_calls
+    assert append is True
+    assert data.Mark == 2
+
+
+def test_select_edge_by_coord_rejects_an_edge_outside_tolerance() -> None:
+    """No edge at the point: fail rather than select the nearest one anyway."""
+    distant = _FakeEdge((0.0, 0.0, 0.002))  # 2 mm away
+    adapter = _FakeFeatureAdapter()
+    adapter.currentModel = _edge_pick_model(
+        (SimpleNamespace(GetEdges=lambda: [distant]),)
+    )
+
+    assert features._select_edge_by_coord(adapter, 0.0, 0.0, 0.0, append=False) is False
+    assert distant.select_calls == []
+
+
+def _install_fake_pywin32(monkeypatch, dispatch) -> None:
+    """Stand in for pythoncom / win32com.client.dynamic on any platform."""
+    import sys
+    import types
+
+    pythoncom = types.ModuleType("pythoncom")
+    pythoncom.MakeIID = lambda iid: f"IID:{iid}"
+    pythoncom.IID_IDispatch = "IID_IDispatch"
+    dynamic = types.ModuleType("win32com.client.dynamic")
+    dynamic.Dispatch = dispatch
+    client = types.ModuleType("win32com.client")
+    client.dynamic = dynamic
+    win32com = types.ModuleType("win32com")
+    win32com.client = client
+    monkeypatch.setitem(sys.modules, "pythoncom", pythoncom)
+    monkeypatch.setitem(sys.modules, "win32com", win32com)
+    monkeypatch.setitem(sys.modules, "win32com.client", client)
+    monkeypatch.setitem(sys.modules, "win32com.client.dynamic", dynamic)
+
+
+def test_select_entity_falls_back_to_an_ientity_query_interface(monkeypatch) -> None:
+    """An IEdge dispatch that cannot resolve Select4 is re-queried as IEntity."""
+    as_entity = _FakeEdge(None)
+    queried: list[tuple] = []
+
+    class _EdgeDispatch:
+        def Select4(self, append, data):
+            raise AttributeError("Select4")  # not an IEdge member
+
+        _oleobj_ = SimpleNamespace(
+            QueryInterface=lambda iid, disp: (
+                queried.append((iid, disp)) or "pyidispatch"
+            )
+        )
+
+    _install_fake_pywin32(
+        monkeypatch, lambda obj: as_entity if obj == "pyidispatch" else None
+    )
+    adapter = _FakeFeatureAdapter()
+    adapter.currentModel = _edge_pick_model(())
+
+    assert features._select_entity(adapter, _EdgeDispatch(), False, 0) is True
+    assert queried == [(f"IID:{features._IID_IENTITY}", "IID_IDispatch")]
+    assert len(as_entity.select_calls) == 1
+
+
+def test_select_entity_returns_false_when_query_interface_fails() -> None:
+    adapter = _FakeFeatureAdapter()
+    adapter.currentModel = _edge_pick_model(())
+
+    # Select4 refuses and there is no _oleobj_ to QueryInterface.
+    assert features._select_entity(adapter, _FakeEdge(None, False), False, 0) is False
+
+
+def test_select_entity_without_type_info_or_select_data(monkeypatch) -> None:
+    """No sw_type_info and no ISelectData: still selects, with a null Data."""
+    _hide_module(monkeypatch, "solidworks_mcp.adapters.sw_type_info")
+    edge = _FakeEdge(None)
+    adapter = _FakeFeatureAdapter()
+    adapter.currentModel = _edge_pick_model(())
+    adapter.currentModel.SelectionManager = SimpleNamespace(
+        CreateSelectData=lambda: None
+    )
+
+    assert features._select_entity(adapter, edge, True, 1) is True
+    ((append, data),) = edge.select_calls
+    assert append is True
+    assert data is not None
+
+
+def test_empty_variant_without_pywin32_is_none(monkeypatch) -> None:
+    import sys
+
+    monkeypatch.setitem(sys.modules, "pythoncom", None)
+
+    assert features._empty_variant() is None
 
 
 # ---- version-specific and selection-failure feature paths ---------------------

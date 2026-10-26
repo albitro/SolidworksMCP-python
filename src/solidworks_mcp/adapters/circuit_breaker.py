@@ -59,15 +59,24 @@ class _BreakerBucket:
         failure_count (int): Consecutive failures recorded in ``CLOSED``/``OPEN``.
         last_failure_time (float): ``time.time()`` of the most recent failure.
         half_open_calls (int): Calls let through since entering ``HALF_OPEN``.
+        last_error (str | None): Error text of the most recent real failure,
+            echoed in fast-fail responses so an open breaker never hides why.
     """
 
-    __slots__ = ("state", "failure_count", "last_failure_time", "half_open_calls")
+    __slots__ = (
+        "state",
+        "failure_count",
+        "last_failure_time",
+        "half_open_calls",
+        "last_error",
+    )
 
     def __init__(self) -> None:
         self.state = CircuitState.CLOSED
         self.failure_count = 0
         self.last_failure_time: float = 0.0
         self.half_open_calls = 0
+        self.last_error: str | None = None
 
 
 class CircuitBreakerAdapter(SolidWorksAdapter):
@@ -136,6 +145,7 @@ class CircuitBreakerAdapter(SolidWorksAdapter):
         self.failure_count = 0
         self.last_failure_time: float = 0.0
         self.half_open_calls = 0
+        self.last_error: str | None = None
 
         # Per-operation buckets, keyed by operation_name, used by every named
         # method that goes through _execute_with_circuit_breaker.
@@ -215,15 +225,19 @@ class CircuitBreakerAdapter(SolidWorksAdapter):
             bucket.state = CircuitState.CLOSED
             bucket.failure_count = 0
             bucket.half_open_calls = 0
+            bucket.last_error = None
         elif bucket.state == CircuitState.CLOSED:
             # Reset failure count on success
             bucket.failure_count = 0
+            bucket.last_error = None
 
-    def _record_failure(self, bucket: Any = None) -> None:
+    def _record_failure(self, bucket: Any = None, error: str | None = None) -> None:
         """Record failed operation.
 
         Args:
             bucket (Any): The breaker bucket to update. Defaults to ``self``.
+            error (str | None): The failure's own error text, kept so later
+                fast-fail responses can say why the breaker is open.
 
         Returns:
             None: None.
@@ -232,10 +246,15 @@ class CircuitBreakerAdapter(SolidWorksAdapter):
             bucket = self
         bucket.failure_count += 1
         bucket.last_failure_time = time.time()
+        if error:
+            bucket.last_error = error
 
         if bucket.state == CircuitState.HALF_OPEN:
             # Go back to open state
             bucket.state = CircuitState.OPEN
+            logger.warning(
+                f"Circuit breaker re-opened: half-open trial call failed ({error})"
+            )
         elif (
             bucket.state == CircuitState.CLOSED
             and bucket.failure_count >= self.failure_threshold
@@ -245,6 +264,31 @@ class CircuitBreakerAdapter(SolidWorksAdapter):
             logger.warning(
                 f"Circuit breaker opened after {bucket.failure_count} failures"
             )
+
+    def _fast_fail_message(self, operation_name: str, bucket: Any) -> str:
+        """Describe a rejected call: state, failure count, wait, last real error.
+
+        A bare "breaker is open" hides the failure that tripped it, and a
+        rejected call never reaches the adapter, so this text is the only
+        place the caller can learn why every retry fails.
+
+        Args:
+            operation_name (str): The rejected operation's name.
+            bucket (Any): That operation's breaker bucket.
+
+        Returns:
+            str: The error text for the fast-fail result.
+        """
+        message = (
+            f"Circuit breaker is {bucket.state.value} for {operation_name} "
+            f"after {bucket.failure_count} consecutive failure(s)"
+        )
+        if bucket.state == CircuitState.OPEN:
+            remaining = self.recovery_timeout - (time.time() - bucket.last_failure_time)
+            message += f"; next trial call allowed in {max(0.0, remaining):.0f}s"
+        if bucket.last_error:
+            message += f". Last error: {bucket.last_error}"
+        return message
 
     async def _execute_with_circuit_breaker(
         self,
@@ -274,8 +318,12 @@ class CircuitBreakerAdapter(SolidWorksAdapter):
         if not self._should_allow_request(bucket):
             return AdapterResult(
                 status=AdapterResultStatus.ERROR,
-                error=f"Circuit breaker is {bucket.state.value} for {operation_name}",
-                metadata={"circuit_state": bucket.state.value},
+                error=self._fast_fail_message(operation_name, bucket),
+                metadata={
+                    "circuit_state": bucket.state.value,
+                    "failure_count": bucket.failure_count,
+                    "last_error": bucket.last_error,
+                },
             )
 
         if bucket.state == CircuitState.HALF_OPEN:
@@ -288,12 +336,12 @@ class CircuitBreakerAdapter(SolidWorksAdapter):
             if result.is_success or not error_results_are_failures:
                 self._record_success(bucket)
             else:
-                self._record_failure(bucket)
+                self._record_failure(bucket, result.error)
             self._soc_log(operation_name, input_dict, result, latency_ms)
             return result
         except Exception as e:
             latency_ms = (time.time() - t0) * 1000.0
-            self._record_failure(bucket)
+            self._record_failure(bucket, str(e))
             err_result: AdapterResult[T] = AdapterResult(
                 status=AdapterResultStatus.ERROR,
                 error=f"Circuit breaker caught exception in {operation_name}: {e}",
@@ -397,6 +445,7 @@ class CircuitBreakerAdapter(SolidWorksAdapter):
                 "failure_count": bucket.failure_count,
                 "last_failure_time": bucket.last_failure_time,
                 "half_open_calls": bucket.half_open_calls,
+                "last_error": bucket.last_error,
             }
             for name, bucket in self._buckets.items()
         }

@@ -297,7 +297,15 @@ class SolidWorksFeaturesMixin:
 def _create_extrusion_impl(
     adapter: Any, params: ExtrusionParameters
 ) -> AdapterResult[SolidWorksFeature]:
-    """Create a boss-extrude feature from the active sketch profile.
+    """Create a boss-extrude feature from a named or tracked sketch profile.
+
+    The profile sketch is resolved and selected first via
+    :func:`_select_profile_sketch`: ``params.sketch_name`` when given
+    (missing name -> immediate error), else the sketch tracked from the last
+    ``create_sketch``/``exit_sketch``. Only when neither resolves does it fall
+    back to whatever is already selected, for callers that never name one.
+    Relying on that implicit selection is what made a named extrusion fail
+    after any intervening call had cleared it.
 
     Attempts the modern ``FeatureExtrusion3`` COM call first; falls back to the
     legacy ``FeatureExtrusion2`` signature when the newer overload is absent.
@@ -323,15 +331,19 @@ def _create_extrusion_impl(
               directions from the sketch plane.
             - ``auto_fillet_corners`` (bool): Round sharp thin-wall corners.
             - ``fillet_corners_radius`` (float): Corner fillet radius in mm.
+            - ``sketch_name`` (str | None): Sketch to extrude. See sketch
+              resolution above.
 
     Returns:
         AdapterResult[SolidWorksFeature]: On success, ``data`` is a
         ``SolidWorksFeature`` whose ``type`` is ``"Extrusion"``.  On failure,
-        ``status`` is ``ERROR`` and ``error`` contains a descriptive message.
+        ``status`` is ``ERROR`` and ``error`` names the targeted sketch and
+        each COM variant's own error text.
 
     Raises:
-        Exception: Propagated through ``_handle_com_operation`` when the COM
-            call returns ``None`` for the created feature object.
+        Exception: Propagated through ``_handle_com_operation`` when the
+            sketch cannot be resolved/selected or the COM call returns
+            ``None`` for the created feature object.
 
     Example::
 
@@ -369,8 +381,13 @@ def _create_extrusion_impl(
             both_directions=bool(getattr(params, "both_directions", False)),
             auto_fillet_corners=bool(getattr(params, "auto_fillet_corners", False)),
             fillet_corners_radius=float(getattr(params, "fillet_corners_radius", 0.0)),
+            sketch_name=getattr(params, "sketch_name", None) or None,
         )
         feature_manager = adapter.currentModel.FeatureManager
+        target_sketch = _select_profile_sketch(
+            adapter, normalized.sketch_name, verb="extrude", required=False
+        )
+        variant_errors: list[str] = []
 
         if normalized.thin_feature and normalized.thin_thickness:
             t0 = adapter.constants.get("swStartSketchPlane", 0)
@@ -434,61 +451,57 @@ def _create_extrusion_impl(
                 )
         else:
             t0 = adapter.constants.get("swStartSketchPlane", 0)
-            try:
-                feature = feature_manager.FeatureExtrusion3(
-                    True,
-                    False,
-                    normalized.reverse_direction,
-                    adapter.constants["swEndCondBlind"],
-                    adapter.constants["swEndCondBlind"],
-                    normalized.depth / 1000.0,
-                    0.0,
-                    False,
-                    False,
-                    False,
-                    False,
-                    normalized.draft_angle * 3.14159 / 180.0,
-                    0.0,
-                    False,
-                    False,
-                    False,
-                    False,
-                    normalized.merge_result,
-                    False,
-                    True,
-                    t0,
-                    0.0,
-                    False,
+            solid_args = (
+                True,
+                False,
+                normalized.reverse_direction,
+                adapter.constants["swEndCondBlind"],
+                adapter.constants["swEndCondBlind"],
+                normalized.depth / 1000.0,
+                0.0,
+                False,
+                False,
+                False,
+                False,
+                normalized.draft_angle * 3.14159 / 180.0,
+                0.0,
+                False,
+                False,
+                False,
+                False,
+                normalized.merge_result,
+                False,
+                True,
+                t0,
+                0.0,
+                False,
+            )
+            feature, extrusion3_error = adapter._attempt_with_error(
+                lambda: feature_manager.FeatureExtrusion3(*solid_args)
+            )
+            if extrusion3_error is not None:
+                variant_errors.append(f"FeatureExtrusion3: {extrusion3_error}")
+                feature, extrusion2_error = adapter._attempt_with_error(
+                    lambda: feature_manager.FeatureExtrusion2(*solid_args)
                 )
-            except Exception:
-                feature = feature_manager.FeatureExtrusion2(
-                    True,
-                    False,
-                    normalized.reverse_direction,
-                    adapter.constants["swEndCondBlind"],
-                    adapter.constants["swEndCondBlind"],
-                    normalized.depth / 1000.0,
-                    0.0,
-                    False,
-                    False,
-                    False,
-                    False,
-                    normalized.draft_angle * 3.14159 / 180.0,
-                    0.0,
-                    False,
-                    False,
-                    False,
-                    False,
-                    normalized.merge_result,
-                    False,
-                    True,
-                    t0,
-                    0.0,
-                    False,
-                )
+                if extrusion2_error is not None:
+                    variant_errors.append(f"FeatureExtrusion2: {extrusion2_error}")
 
         if not feature:
-            raise Exception("Failed to create extrusion feature")
+            profile = (
+                f"sketch '{target_sketch}'"
+                if target_sketch
+                else "the current selection (no sketch_name given and no tracked sketch)"
+            )
+            detail = (
+                "; ".join(variant_errors)
+                if variant_errors
+                else "the COM call returned no feature without raising — the "
+                "profile is likely not a closed, non-self-intersecting loop"
+            )
+            raise Exception(
+                f"Failed to create extrusion feature from {profile}: {detail}"
+            )
 
         return SolidWorksFeature(
             name=feature.Name,
@@ -500,6 +513,7 @@ def _create_extrusion_impl(
                 "reverse_direction": normalized.reverse_direction,
                 "thin_feature": normalized.thin_feature,
                 "thin_thickness": normalized.thin_thickness,
+                "sketch_name": target_sketch,
             },
             properties={"created": datetime.now().isoformat()},
         )
@@ -802,6 +816,112 @@ def _profile_feature_names(adapter: Any) -> list[str]:
     except Exception:
         pass
     return names
+
+
+def _select_profile_sketch(
+    adapter: Any, sketch_name: str | None, *, verb: str, required: bool
+) -> str | None:
+    """Resolve the profile sketch for a feature and select it explicitly.
+
+    Resolution never guesses:
+
+    1. ``sketch_name``, if given, is matched case-insensitively against the
+       live feature tree (:func:`_profile_feature_names`). No match -> error
+       listing the sketches that do exist.
+    2. Otherwise ``adapter._last_sketch_name`` (set by the latest
+       ``create_sketch``/``exit_sketch``) is used only if it also matches a
+       real sketch in the tree.
+    3. Otherwise: an error when ``required``, else ``None`` so the caller
+       falls back to whatever is already selected (the legacy behaviour
+       ``create_extrusion`` kept for callers that never name a sketch).
+
+    The resolved sketch is selected with ``SelectByID2`` rather than relying
+    on SolidWorks' implicit active-sketch state: any call in between (mass
+    properties, document activation, a delete) clears that state, and the
+    feature then silently builds from nothing.
+
+    Args:
+        adapter: A connected adapter with a valid ``currentModel``.
+        sketch_name: Explicit sketch to use, or ``None``.
+        verb: How the error text describes the feature's use of the sketch,
+            e.g. ``"cut from"`` or ``"extrude"``.
+        required: Raise instead of returning ``None`` when no sketch resolves.
+
+    Returns:
+        str | None: The selected sketch's tree name, or ``None`` when nothing
+        resolved and ``required`` is false.
+
+    Raises:
+        Exception: The named sketch does not exist, nothing resolved while
+            ``required``, or ``SelectByID2`` rejected the sketch.
+    """
+    tree_names = _profile_feature_names(adapter)
+
+    def _match_tree_name(name: str) -> str | None:
+        for real in tree_names:
+            if real.lower() == name.lower():
+                return real
+        return None
+
+    available = ", ".join(tree_names) if tree_names else "(none found)"
+    if sketch_name:
+        target_sketch = _match_tree_name(sketch_name)
+        if target_sketch is None:
+            raise Exception(
+                f"Sketch '{sketch_name}' not found in the "
+                f"feature tree. Sketches available to {verb}: {available}"
+            )
+    else:
+        last_tracked = getattr(adapter, "_last_sketch_name", None)
+        target_sketch = _match_tree_name(last_tracked) if last_tracked else None
+        if target_sketch is None:
+            if not required:
+                return None
+            hint = (
+                f" (the last create_sketch call returned '{last_tracked}', "
+                "which does not match any real sketch in the model — "
+                "SolidWorks likely didn't hand back a usable sketch "
+                "object synchronously)"
+                if last_tracked
+                else " (no create_sketch/exit_sketch call has run this session)"
+            )
+            raise Exception(
+                "No sketch_name given, and no reliably-tracked sketch to "
+                f"{verb}{hint}. Pass sketch_name explicitly. Sketches "
+                f"available to {verb}: {available}"
+            )
+
+    adapter._attempt(lambda: adapter.currentModel.ClearSelection2(True), default=None)
+    # Callout must be an explicit VT_DISPATCH null, not plain None — a bare
+    # None marshals as VT_NULL and SolidWorks rejects the whole call with
+    # DISP_E_TYPEMISMATCH (runbook item 11). _attempt_with_error keeps that
+    # error in the failure message instead of a generic "selection failed".
+    select_result, select_error = adapter._attempt_with_error(
+        lambda: adapter.currentModel.Extension.SelectByID2(
+            target_sketch,
+            "SKETCH",
+            0.0,
+            0.0,
+            0.0,
+            False,
+            0,
+            _null_callout(),
+            0,
+        )
+    )
+    if not select_result:
+        reason = (
+            f" COM error: {select_error}"
+            if select_error is not None
+            else " SelectByID2 returned False with no COM error — the "
+            "sketch may already be consumed by another feature, be "
+            "suppressed, or not be a valid selectable profile."
+        )
+        raise Exception(
+            f"Failed to select sketch '{target_sketch}' via SelectByID2." + reason
+        )
+    adapter._last_sketch_name = target_sketch
+    return target_sketch
 
 
 def _create_sweep_impl(
@@ -1196,83 +1316,12 @@ def _create_cut_extrude_impl(
         )
         feature_manager = adapter.currentModel.FeatureManager
 
-        # --- Sketch resolution: explicit > tracked-and-verified > clear
-        # error. Never a silent guess — see the docstring above. Resolving
-        # this up front (before any FeatureCut attempt) also lets every
-        # failure below name the sketch it was actually targeting.
-        tree_names = _profile_feature_names(adapter)
-
-        def _match_tree_name(name: str) -> str | None:
-            for real in tree_names:
-                if real.lower() == name.lower():
-                    return real
-            return None
-
-        available = ", ".join(tree_names) if tree_names else "(none found)"
-        if normalized.sketch_name:
-            target_sketch = _match_tree_name(normalized.sketch_name)
-            if target_sketch is None:
-                raise Exception(
-                    f"Sketch '{normalized.sketch_name}' not found in the "
-                    f"feature tree. Sketches available to cut from: {available}"
-                )
-        else:
-            last_tracked = getattr(adapter, "_last_sketch_name", None)
-            target_sketch = _match_tree_name(last_tracked) if last_tracked else None
-            if target_sketch is None:
-                hint = (
-                    f" (the last create_sketch call returned '{last_tracked}', "
-                    "which does not match any real sketch in the model — "
-                    "SolidWorks likely didn't hand back a usable sketch "
-                    "object synchronously)"
-                    if last_tracked
-                    else " (no create_sketch/exit_sketch call has run this session)"
-                )
-                raise Exception(
-                    "No sketch_name given, and no reliably-tracked sketch to "
-                    f"cut from{hint}. Pass sketch_name explicitly. Sketches "
-                    f"available to cut from: {available}"
-                )
-
-        # Explicit selection before any FeatureCut attempt. SolidWorks' own
-        # "implicit" active-sketch state (whatever was last open) is never
-        # relied upon — that is exactly the race that made this feature
-        # intermittently cut nothing while reporting no error at all.
-        adapter._attempt(
-            lambda: adapter.currentModel.ClearSelection2(True), default=None
+        # Sketch resolution + explicit selection before any FeatureCut
+        # attempt — see _select_profile_sketch. Resolving up front also lets
+        # every failure below name the sketch it was actually targeting.
+        target_sketch = _select_profile_sketch(
+            adapter, normalized.sketch_name, verb="cut from", required=True
         )
-        # Callout must be an explicit VT_DISPATCH null, not plain None — a
-        # bare None marshals as VT_NULL and SolidWorks rejects the whole call
-        # with DISP_E_TYPEMISMATCH (runbook item 11). Using
-        # _attempt_with_error (not _attempt) here means that error surfaces
-        # in the failure message below instead of being swallowed into a
-        # generic "selection failed" guess.
-        select_result, select_error = adapter._attempt_with_error(
-            lambda: adapter.currentModel.Extension.SelectByID2(
-                target_sketch,
-                "SKETCH",
-                0.0,
-                0.0,
-                0.0,
-                False,
-                0,
-                _null_callout(),
-                0,
-            )
-        )
-        sketch_selected = bool(select_result)
-        if not sketch_selected:
-            reason = (
-                f" COM error: {select_error}"
-                if select_error is not None
-                else " SelectByID2 returned False with no COM error — the "
-                "sketch may already be consumed by another feature, be "
-                "suppressed, or not be a valid selectable profile."
-            )
-            raise Exception(
-                f"Failed to select sketch '{target_sketch}' via SelectByID2." + reason
-            )
-        adapter._last_sketch_name = target_sketch
 
         end_condition = (normalized.end_condition or "Blind").strip().lower()
         t1 = adapter.constants["swEndCondBlind"]
@@ -1559,6 +1608,121 @@ def _parse_edge_spec(
     return edge_name, 0.0, 0.0, 0.0, "EDGE"
 
 
+#: Farthest an edge's closest point may lie from the requested coordinate and
+#: still count as "the edge at that point", in metres.
+_EDGE_PICK_TOLERANCE_M = 5e-4
+
+#: ``IEntity`` interface id (SW type library). ``Select4`` lives on
+#: ``IEntity``, not ``IEdge``, so an edge dispatch may need this QI first.
+_IID_IENTITY = "{83A33D65-27C5-11CE-BFD4-00400513BB57}"
+
+
+def _nearest_body_edge(
+    adapter: Any, x: float, y: float, z: float
+) -> tuple[Any, float] | None:
+    """Find the solid-body edge geometrically closest to (x, y, z) metres.
+
+    Walks ``IPartDoc.GetBodies2`` -> ``IBody2.GetEdges`` and measures each
+    edge with ``IEdge.GetClosestPointOn``. Unlike a ``SelectByID2``
+    coordinate pick, this does not depend on the view: the pick there casts
+    along the current view direction, so a concave edge hidden behind
+    another face resolves to whichever edge the ray reaches first.
+
+    Args:
+        adapter: A connected adapter with a valid ``currentModel``.
+        x: X in metres.
+        y: Y in metres.
+        z: Z in metres.
+
+    Returns:
+        tuple[Any, float] | None: ``(edge, distance_m)`` for the closest
+        edge, or ``None`` when the bodies or edges cannot be read (e.g. the
+        active document is not a part).
+    """
+    import math
+
+    try:
+        from .. import sw_type_info as _sw_type_info
+    except ImportError:
+        return None
+
+    part = _sw_type_info.flagged(adapter.currentModel, "IPartDoc")
+    raw_bodies = adapter._attempt(lambda: part.GetBodies2(0, True), default=None)
+    bodies = (
+        list(raw_bodies)
+        if isinstance(raw_bodies, (list, tuple))
+        else ([raw_bodies] if raw_bodies else [])
+    )
+    best: tuple[Any, float] | None = None
+    for body in bodies:
+        _sw_type_info.flag_members(body, "GetEdges")
+        raw_edges = adapter._attempt(lambda b=body: b.GetEdges(), default=None)
+        edges = list(raw_edges) if isinstance(raw_edges, (list, tuple)) else []
+        for edge in edges:
+            _sw_type_info.flag_members(edge, "GetClosestPointOn")
+            point = adapter._attempt(
+                lambda e=edge: e.GetClosestPointOn(x, y, z), default=None
+            )
+            if not isinstance(point, (list, tuple)) or len(point) < 3:
+                continue
+            distance = math.dist((x, y, z), tuple(float(v) for v in point[:3]))
+            if best is None or distance < best[1]:
+                best = (edge, distance)
+    return best
+
+
+def _select_entity(adapter: Any, entity: Any, append: bool, mark: int) -> bool:
+    """Select a body edge/face under ``mark`` via ``IEntity.Select4``.
+
+    Tries the dispatch as returned first, then a ``QueryInterface`` to
+    ``IEntity`` — ``Select4`` is an ``IEntity`` member, and an ``IEdge``
+    dispatch from ``IBody2.GetEdges`` need not resolve it.
+
+    Args:
+        adapter: A connected adapter with a valid ``currentModel``.
+        entity: The edge or face dispatch.
+        append: Add to the current selection instead of replacing it.
+        mark: Selection mark for the feature that consumes the selection.
+
+    Returns:
+        bool: True when SolidWorks reports the entity selected.
+    """
+    try:
+        from .. import sw_type_info as _sw_type_info
+    except ImportError:
+        _sw_type_info = None  # type: ignore[assignment]
+
+    sel_mgr = adapter.currentModel.SelectionManager
+    if _sw_type_info is not None:
+        _sw_type_info.flag_members(sel_mgr, "CreateSelectData")
+    select_data = adapter._attempt(lambda: sel_mgr.CreateSelectData(), default=None)
+    if select_data is not None:
+        adapter._attempt(lambda: setattr(select_data, "Mark", mark), default=None)
+    data = select_data if select_data is not None else _null_callout()
+
+    def _select(target: Any) -> bool:
+        if _sw_type_info is not None:
+            _sw_type_info.flag_members(target, "Select4")
+        return bool(
+            adapter._attempt(lambda: target.Select4(append, data), default=False)
+        )
+
+    if _select(entity):
+        return True
+    try:
+        import pythoncom
+        from win32com.client import dynamic
+
+        as_entity = dynamic.Dispatch(
+            entity._oleobj_.QueryInterface(
+                pythoncom.MakeIID(_IID_IENTITY), pythoncom.IID_IDispatch
+            )
+        )
+    except Exception:
+        return False
+    return _select(as_entity)
+
+
 def _select_edge_by_coord(
     adapter: Any,
     x: float,
@@ -1568,12 +1732,22 @@ def _select_edge_by_coord(
     mark: int = 0,
     entity_type: str = "EDGE",
 ) -> bool:
-    """Select the edge (or face) nearest to (x, y, z) in metres via ``SelectByID2``.
+    """Select the edge (or face) at (x, y, z) in metres.
+
+    For ``"EDGE"`` the edge is chosen geometrically: the solid-body edge
+    whose closest point lies within ``_EDGE_PICK_TOLERANCE_M`` of the
+    coordinate (see :func:`_nearest_body_edge`). ``SelectByID2`` casts its
+    pick along the current view, so it silently selected the wrong edge
+    whenever the requested one was hidden behind other geometry — e.g. the
+    concave corner under a cantilevered plate picked from a bottom view
+    landed on the wall's bottom edges instead. Only when the bodies cannot
+    be read does this fall back to the ``SelectByID2`` pick; when they can
+    and no edge is within tolerance, it returns False rather than guess.
 
     Calls ``ForceRebuild3`` on the first entity in the selection set so that
-    recent features are fully tessellated and selectable. Tries the primary
-    coordinate and several small radial/Y offsets to improve hit probability
-    on curved edges.
+    recent features are fully tessellated and selectable. The fallback pick
+    tries the primary coordinate and several small radial/Y offsets to
+    improve hit probability on curved edges.
 
     ``entity_type`` is normally ``"EDGE"``, but pass ``"FACE"`` to select a
     whole face instead — ``InsertFeatureChamfer``/``FeatureFillet3`` then
@@ -1593,6 +1767,14 @@ def _select_edge_by_coord(
     # entity in the selection set (when append=False this is the first one).
     if not append:
         adapter._attempt(lambda: model.ForceRebuild3(True), default=None)
+
+    if entity_type == "EDGE":
+        nearest = _nearest_body_edge(adapter, x, y, z)
+        if nearest is not None:
+            edge, distance = nearest
+            if distance > _EDGE_PICK_TOLERANCE_M:
+                return False
+            return _select_entity(adapter, edge, append, mark)
 
     r = math.sqrt(x**2 + z**2)
     if r > 0:
@@ -1725,7 +1907,7 @@ def _add_fillet_impl(
         # SW 2025+ (major >= 33): IModelDoc2.FeatureFillet3 (9 params).
         # Returns a non-zero int on success — NOT an IFeature — so we look up
         # the last modified feature afterwards to get the name/id.
-        # Older builds: IFeatureManager.FeatureFillet3 (15 params, returns IFeature).
+        # Older builds: IFeatureManager.FeatureFillet3 (14 params, returns IFeature).
         if fillet_sw_major >= 33:
             result_code = adapter.currentModel.FeatureFillet3(
                 radius / 1000.0,  # R1 in meters
@@ -1744,26 +1926,36 @@ def _add_fillet_impl(
                 )
             feature = None  # int return — retrieve feature object below
         else:
+            # Signature from the SW 2024 type library (gen_py, IFeatureManager):
+            # Options, R1, R2, Rho, Ftyp, OverflowType, ConicRhoType, then seven
+            # VARIANT arrays. The previous call passed 15 positional args and
+            # every fillet failed with DISP_E_BADPARAMCOUNT (-2147352562).
+            # Options 195 is what the macro recorder writes for a plain
+            # constant-radius fillet; unused arrays go as VT_EMPTY, like an
+            # unassigned VBA Variant.
             feature_manager = adapter.currentModel.FeatureManager
-            feature = feature_manager.FeatureFillet3(
-                radius / 1000.0,
-                0,
-                0,
-                0,
-                0,
-                False,
-                False,
-                False,
-                False,
-                False,
-                False,
-                False,
-                False,
-                0,
-                False,
+            unused = _empty_variant()
+            feature, fillet3_error = adapter._attempt_with_error(
+                lambda: feature_manager.FeatureFillet3(
+                    195,  # Options
+                    radius / 1000.0,  # R1 in metres
+                    0.0,  # R2
+                    0.0,  # Rho
+                    0,  # Ftyp: simple constant-radius fillet
+                    0,  # OverflowType: default
+                    0,  # ConicRhoType
+                    unused,  # Radii
+                    unused,  # Dist2Arr
+                    unused,  # RhoArr
+                    unused,  # SetBackDistances
+                    unused,  # PointRadiusArray
+                    unused,  # PointDist2Array
+                    unused,  # PointRhoArray
+                )
             )
             if not feature:
-                raise Exception("Failed to create fillet")
+                detail = f" (FeatureFillet3: {fillet3_error})" if fillet3_error else ""
+                raise Exception(f"Failed to create fillet{detail}")
 
         # Resolve the feature name — FeatureFillet3 on SW 2025+ returns an int,
         # not an IFeature, so we can only report a default name here.
@@ -2400,6 +2592,24 @@ def _null_callout() -> Any:
     except ImportError:
         return _NULL_CALLOUT_SENTINEL
     return _win32com.VARIANT(pythoncom.VT_DISPATCH, None)
+
+
+def _empty_variant() -> Any:
+    """Return a ``VT_EMPTY`` value for an unused optional VARIANT argument.
+
+    Matches an unassigned VBA ``Variant``, which is what recorded macros pass
+    for the unused array arguments of calls like ``FeatureFillet3``. Plain
+    ``None`` would marshal as ``VT_NULL`` instead (see :func:`_null_callout`).
+
+    Returns:
+        Any: ``pythoncom.Empty``, or ``None`` when pywin32 is unavailable
+        (mock/Linux runs, where no real COM call is made).
+    """
+    try:
+        import pythoncom
+    except ImportError:
+        return None
+    return pythoncom.Empty
 
 
 def _select_reference_entity(

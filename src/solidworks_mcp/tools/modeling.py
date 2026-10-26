@@ -1137,12 +1137,19 @@ async def register_modeling_tools(
             merge_result=input_data.merge_result,
             feature_scope=False,
             auto_select=True,
+            sketch_name=input_data.sketch_name,
         )
 
         result = await adapter.create_extrusion(params)
 
         require_success(result, context="Failed to create extrusion")
         feature = result.data
+        feature_params = _result_value(feature, "parameters", default={})
+        sketch_used = (
+            feature_params.get("sketch_name")
+            if isinstance(feature_params, dict)
+            else None
+        ) or input_data.sketch_name
         return {
             "status": "success",
             "message": f"Created extrusion: {_result_value(feature, 'feature_name', 'name', default='Extrusion')}",
@@ -1150,7 +1157,7 @@ async def register_modeling_tools(
                 "name": _result_value(
                     feature, "feature_name", "name", default="Extrusion"
                 ),
-                "sketch": input_data.sketch_name,
+                "sketch": sketch_used,
                 "depth": input_data.depth,
                 "direction": input_data.direction,
             },

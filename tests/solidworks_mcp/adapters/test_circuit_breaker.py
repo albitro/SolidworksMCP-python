@@ -867,6 +867,82 @@ class TestCircuitBreaker:
         assert info.is_success
 
     @pytest.mark.asyncio
+    async def test_circuit_breaker_fast_fail_reports_the_real_error(self):
+        """An open breaker must say why, not just that it is open.
+
+        A rejected call never reaches the adapter, so the fast-fail text was
+        the only thing callers saw: the profile/COM error that tripped the
+        breaker (and every half-open retry that re-tripped it) stayed hidden.
+        """
+
+        class _FailingExtrudeAdapter:
+            async def create_extrusion(self, params):
+                return AdapterResult(
+                    status=AdapterResultStatus.ERROR,
+                    error="Failed to create extrusion feature from sketch 'S1'",
+                )
+
+        cb = CircuitBreakerAdapter(
+            adapter=_FailingExtrudeAdapter(), failure_threshold=1, recovery_timeout=30
+        )
+        params = ExtrusionParameters(depth=5.0)
+
+        first = await cb.create_extrusion(params)
+        assert "from sketch 'S1'" in (first.error or "")
+
+        tripped = await cb.create_extrusion(params)
+        error = tripped.error or ""
+        assert "Circuit breaker is open for create_extrusion" in error
+        assert "after 1 consecutive failure(s)" in error
+        assert "next trial call allowed in" in error
+        assert (
+            "Last error: Failed to create extrusion feature from sketch 'S1'" in error
+        )
+        assert tripped.metadata["last_error"].endswith("sketch 'S1'")
+
+    @pytest.mark.asyncio
+    async def test_circuit_breaker_half_open_rejection_has_no_wait_estimate(self):
+        """Half-open with its trial calls used up rejects without a countdown."""
+        cb = CircuitBreakerAdapter(
+            adapter=MockSolidWorksAdapter({}), failure_threshold=1, recovery_timeout=30
+        )
+        bucket = cb._get_bucket("create_extrusion")
+        bucket.state = CircuitState.HALF_OPEN
+        bucket.half_open_calls = cb.half_open_max_calls
+        bucket.failure_count = 2
+
+        rejected = await cb.create_extrusion(ExtrusionParameters(depth=5.0))
+
+        error = rejected.error or ""
+        assert error == (
+            "Circuit breaker is half_open for create_extrusion "
+            "after 2 consecutive failure(s)"
+        )
+
+    @pytest.mark.asyncio
+    async def test_circuit_breaker_success_clears_last_error(self):
+        outcomes = [
+            AdapterResult(status=AdapterResultStatus.ERROR, error="boom"),
+            AdapterResult(status=AdapterResultStatus.SUCCESS, data="ok"),
+        ]
+
+        class _FlakyAdapter:
+            async def create_extrusion(self, params):
+                return outcomes.pop(0)
+
+        cb = CircuitBreakerAdapter(
+            adapter=_FlakyAdapter(), failure_threshold=5, recovery_timeout=30
+        )
+        params = ExtrusionParameters(depth=5.0)
+
+        await cb.create_extrusion(params)
+        assert cb._buckets["create_extrusion"].last_error == "boom"
+
+        await cb.create_extrusion(params)
+        assert cb._buckets["create_extrusion"].last_error is None
+        assert cb._buckets["create_extrusion"].failure_count == 0
+
+    @pytest.mark.asyncio
     async def test_circuit_breaker_health_check_flags_open_operation_bucket(self):
         """health_check must report unhealthy when a per-operation bucket is
         open, even though the legacy connection-level breaker stays closed.

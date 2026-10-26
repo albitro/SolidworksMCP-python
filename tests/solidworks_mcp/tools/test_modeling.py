@@ -250,6 +250,37 @@ class TestModelingTools:
         assert result["extrusion"]["direction"] == "blind"
 
     @pytest.mark.asyncio
+    async def test_create_extrusion_passes_sketch_name_to_adapter(
+        self, mcp_server, mock_adapter, mock_config
+    ):
+        """The named sketch must reach the adapter, not just the response.
+
+        The tool used to drop sketch_name, so the adapter extruded whatever
+        happened to be selected and failed once any other call had cleared
+        the selection.
+        """
+        await register_modeling_tools(mcp_server, mock_adapter, mock_config)
+
+        mock_adapter.create_extrusion = AsyncMock(
+            return_value=Mock(
+                is_success=True,
+                data={"feature_name": "Boss-Extrude1"},
+                execution_time=0.8,
+            )
+        )
+
+        tool_func = None
+        for tool in await mcp_server.list_tools():
+            if tool.name == "create_extrusion":
+                tool_func = tool.fn
+                break
+
+        await tool_func(CreateExtrusionInput(sketch_name="스케치33", depth=79.0))
+
+        params = mock_adapter.create_extrusion.await_args.args[0]
+        assert params.sketch_name == "스케치33"
+
+    @pytest.mark.asyncio
     async def test_create_revolve_full(self, mcp_server, mock_adapter, mock_config):
         """Test full revolution creation."""
         await register_modeling_tools(mcp_server, mock_adapter, mock_config)
